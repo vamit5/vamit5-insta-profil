@@ -1,0 +1,32 @@
+name: Produzi Instagram Token
+
+# Pokrece se jednom nedeljno. Instagram dozvoljava refresh najvise
+# jednom na svakih 24h, i token mora biti bar 24h star a manje od 60
+# dana star da bi refresh uspeo -- nedeljno pokretanje je bezbedno i
+# ostavlja veliku marginu pre isteka.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # svakog ponedeljka u 06:00 UTC
+  workflow_dispatch: {}  # dozvoljava i rucno pokretanje, za testiranje
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preuzmi repozitorijum
+        uses: actions/checkout@v4
+
+      - name: Podesi Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instaliraj biblioteke
+        run: pip install requests pynacl
+
+      - name: Produzi token
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: python refresh_token.py
