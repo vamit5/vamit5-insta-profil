@@ -4,15 +4,18 @@ import json
 import time
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
 IG_ACCOUNT_ID = os.environ["IG_ACCOUNT_ID"]
-GDRIVE_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
+GDRIVE_NOTEXT_FOLDER_ID = os.environ["GDRIVE_NOTEXT_FOLDER_ID"]
+GDRIVE_TEXT_FOLDER_ID = os.environ["GDRIVE_TEXT_FOLDER_ID"]
 GDRIVE_SERVICE_ACCOUNT_JSON = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
 
 CLOUDINARY_CLOUD_NAME = "dnbjvccgy"
@@ -21,13 +24,27 @@ CLOUDINARY_UPLOAD_PRESET = "vamit5_reels"
 STATE_FILE = "state.json"
 MIN_CLIP_SECONDS = 9
 MIN_TOTAL_SECONDS = 15
+COOLDOWN_DAYS = 20
 VIDEO_MIME_PREFIX = "video/"
+
+FRAME_W = 1080
+FRAME_H = 1920
+TEXT_ZONE_TOP_FRAC = 0.55
+TEXT_ZONE_BOTTOM_FRAC = 0.80
+MAX_TEXT_WIDTH_FRAC = 0.84
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 CAPTION = (
     'Komentariši "VAMIT" i dobijaš link ka 7-dana besplatnom testu VAMIT-5 App. #joinvamit5\n\n'
     '@vamit5.athletes\n'
     '@vamit5.uniform'
 )
+
+OVERLAY_TEXTS = [
+    "Testiraj VAMIT-5 App 7 dana besplatno",
+    "Komentariši VAMIT i dobijaš 7 dana besplatan VAMIT-5 App",
+    "Sagori do 800 kalorija za 40 minuta uz VAMIT-5",
+]
 
 
 def check_response(resp):
@@ -62,31 +79,35 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def list_videos(drive):
+def list_videos_in_folder(drive, folder_id, folder_tag):
     files = []
     page_token = None
     while True:
         response = run_with_retries(lambda: drive.files().list(
-            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
+            q=f"'{folder_id}' in parents and trashed = false",
             fields="nextPageToken, files(id, name, mimeType, createdTime, videoMediaMetadata)",
             pageToken=page_token,
             pageSize=1000,
         ).execute())
         for f in response.get("files", []):
             if f.get("mimeType", "").startswith(VIDEO_MIME_PREFIX):
+                f["folder"] = folder_tag
                 files.append(f)
         page_token = response.get("nextPageToken")
         if not page_token:
             break
-    files.sort(key=lambda f: (f["createdTime"], f["id"]))
     return files
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    return {"last_file_id": None}
+            state = json.load(fh)
+    else:
+        state = {}
+    state.setdefault("history", {})
+    state.setdefault("text_index", 0)
+    return state
 
 
 def save_state(state):
@@ -94,13 +115,29 @@ def save_state(state):
         json.dump(state, fh, indent=2)
 
 
-def next_start_index(files, last_file_id):
-    if last_file_id is None:
-        return 0
-    for i, f in enumerate(files):
-        if f["id"] == last_file_id:
-            return (i + 1) % len(files)
-    return 0
+def rank_files(files, history, now):
+    never = []
+    cooldown_ok = []
+    fallback = []
+    for f in files:
+        h = history.get(f["id"])
+        if not h or h.get("times_posted", 0) == 0:
+            never.append(f)
+        else:
+            last_posted = datetime.fromisoformat(h["last_posted"])
+            age_days = (now - last_posted).total_seconds() / 86400
+            if age_days >= COOLDOWN_DAYS:
+                cooldown_ok.append((age_days, f))
+            else:
+                fallback.append((age_days, f))
+    if never:
+        never.sort(key=lambda f: f["createdTime"])
+        return never
+    if cooldown_ok:
+        cooldown_ok.sort(key=lambda t: -t[0])
+        return [f for _, f in cooldown_ok]
+    fallback.sort(key=lambda t: -t[0])
+    return [f for _, f in fallback]
 
 
 def download_file(drive, file_id, dest_path):
@@ -140,8 +177,8 @@ def merge_clips(paths, output_path):
     for i, p in enumerate(paths):
         inputs += ["-i", p]
         filter_parts.append(
-            f"[{i}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
+            f"[{i}:v]scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease,"
+            f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{i}]"
         )
     concat_inputs = "".join(f"[v{i}]" for i in range(len(paths)))
     filter_complex = ";".join(filter_parts) + f";{concat_inputs}concat=n={len(paths)}:v=1:a=0[outv]"
@@ -160,8 +197,8 @@ def compress_for_upload(input_path, output_path, keep_audio):
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
+        f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease,"
+        f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,setsar=1",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
         "-maxrate", "3500k", "-bufsize", "7000k",
     ]
@@ -170,6 +207,84 @@ def compress_for_upload(input_path, output_path, keep_audio):
     else:
         cmd += ["-an"]
     cmd.append(output_path)
+    subprocess.run(cmd, check=True)
+
+
+def wrap_text(text, font, max_width):
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        if font.getlength(trial) <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def fit_text_lines(text, max_width, start_size=68, min_size=34):
+    size = start_size
+    font = None
+    lines = None
+    while size >= min_size:
+        font = ImageFont.truetype(FONT_PATH, size)
+        lines = wrap_text(text, font, max_width)
+        if len(lines) <= 3:
+            return font, lines, size
+        size -= 4
+    font = ImageFont.truetype(FONT_PATH, min_size)
+    lines = wrap_text(text, font, max_width)
+    return font, lines, min_size
+
+
+def build_text_overlay(text, out_path):
+    max_text_width = int(FRAME_W * MAX_TEXT_WIDTH_FRAC)
+    font, lines, size = fit_text_lines(text, max_text_width)
+
+    line_height = int(size * 1.3)
+    pad_x, pad_y = 28, 18
+    widest_line = max(font.getlength(line) for line in lines)
+    box_width = min(FRAME_W - 40, int(widest_line) + pad_x * 2)
+    box_height = line_height * len(lines) + pad_y * 2
+
+    zone_top = int(FRAME_H * TEXT_ZONE_TOP_FRAC)
+    zone_bottom = int(FRAME_H * TEXT_ZONE_BOTTOM_FRAC)
+    zone_center = (zone_top + zone_bottom) // 2
+    box_top = max(zone_top, min(zone_bottom - box_height, zone_center - box_height // 2))
+    box_left = (FRAME_W - box_width) // 2
+
+    img = Image.new("RGBA", (FRAME_W, FRAME_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle(
+        [box_left, box_top, box_left + box_width, box_top + box_height],
+        radius=20, fill=(0, 0, 0, 150),
+    )
+
+    y = box_top + pad_y
+    for line in lines:
+        w = font.getlength(line)
+        x = box_left + (box_width - w) / 2
+        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255))
+        y += line_height
+
+    img.save(out_path)
+
+
+def apply_text_overlay(base_path, overlay_png_path, out_path):
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", base_path,
+        "-i", overlay_png_path,
+        "-filter_complex", "[0:v][1:v]overlay=0:0:format=auto[v]",
+        "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "copy",
+        out_path,
+    ]
     subprocess.run(cmd, check=True)
 
 
@@ -240,27 +355,36 @@ def publish_to_instagram(video_url):
 
 def main():
     drive = get_drive_service()
-    files = list_videos(drive)
-    if not files:
-        raise RuntimeError("Nema video fajlova u Google Drive folderu")
+    notext_files = list_videos_in_folder(drive, GDRIVE_NOTEXT_FOLDER_ID, "notext")
+    text_files = list_videos_in_folder(drive, GDRIVE_TEXT_FOLDER_ID, "text")
+    all_files = notext_files + text_files
+    if not all_files:
+        raise RuntimeError("Nema video fajlova ni u jednom Google Drive folderu")
 
     state = load_state()
-    start = next_start_index(files, state.get("last_file_id"))
+    history = state["history"]
+    now = datetime.now(timezone.utc)
+
+    global_rank = rank_files(all_files, history, now)
+    start_file = global_rank[0]
+    folder = start_file["folder"]
+
+    folder_files = [f for f in all_files if f["folder"] == folder]
+    merge_order = rank_files(folder_files, history, now)
+    if merge_order[0]["id"] != start_file["id"]:
+        merge_order = [start_file] + [f for f in merge_order if f["id"] != start_file["id"]]
 
     with tempfile.TemporaryDirectory() as tmp:
         chosen_paths = []
         chosen_files = []
         total_duration = 0.0
-        index = start
-        for _ in range(len(files)):
-            f = files[index]
+        for f in merge_order:
             local_path = os.path.join(tmp, f["id"])
             download_file(drive, f["id"], local_path)
             duration = get_duration(f, local_path)
             chosen_paths.append(local_path)
             chosen_files.append(f)
             total_duration += duration
-            index = (index + 1) % len(files)
 
             if len(chosen_paths) == 1 and duration >= MIN_CLIP_SECONDS:
                 break
@@ -268,17 +392,34 @@ def main():
                 break
 
         if len(chosen_paths) == 1:
-            upload_path = os.path.join(tmp, "solo.mp4")
-            compress_for_upload(chosen_paths[0], upload_path, keep_audio=True)
+            base_path = os.path.join(tmp, "solo.mp4")
+            compress_for_upload(chosen_paths[0], base_path, keep_audio=True)
         else:
-            upload_path = os.path.join(tmp, "merged.mp4")
-            merge_clips(chosen_paths, upload_path)
+            base_path = os.path.join(tmp, "merged.mp4")
+            merge_clips(chosen_paths, base_path)
+
+        if folder == "text":
+            text = OVERLAY_TEXTS[state["text_index"] % len(OVERLAY_TEXTS)]
+            overlay_png = os.path.join(tmp, "overlay.png")
+            build_text_overlay(text, overlay_png)
+            final_path = os.path.join(tmp, "final.mp4")
+            apply_text_overlay(base_path, overlay_png, final_path)
+            upload_path = final_path
+            state["text_index"] = (state["text_index"] + 1) % len(OVERLAY_TEXTS)
+        else:
+            upload_path = base_path
 
         video_url = upload_to_cloudinary(upload_path)
         result = publish_to_instagram(video_url)
         print("Objavljeno:", result)
 
-    state["last_file_id"] = chosen_files[-1]["id"]
+    now_iso = now.isoformat()
+    for f in chosen_files:
+        entry = history.get(f["id"], {"name": f["name"], "times_posted": 0})
+        entry["name"] = f["name"]
+        entry["last_posted"] = now_iso
+        entry["times_posted"] = entry.get("times_posted", 0) + 1
+        history[f["id"]] = entry
     save_state(state)
 
 
