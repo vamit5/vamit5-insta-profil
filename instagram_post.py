@@ -12,16 +12,17 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
 
-IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
-IG_ACCOUNT_ID = os.environ["IG_ACCOUNT_ID"]
-GDRIVE_NOTEXT_FOLDER_ID = os.environ["GDRIVE_NOTEXT_FOLDER_ID"]
-GDRIVE_TEXT_FOLDER_ID = os.environ["GDRIVE_TEXT_FOLDER_ID"]
-GDRIVE_SERVICE_ACCOUNT_JSON = os.environ["GDRIVE_SERVICE_ACCOUNT_JSON"]
+IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN")
+IG_ACCOUNT_ID = os.environ.get("IG_ACCOUNT_ID")
+GDRIVE_NOTEXT_FOLDER_ID = os.environ.get("GDRIVE_NOTEXT_FOLDER_ID")
+GDRIVE_TEXT_FOLDER_ID = os.environ.get("GDRIVE_TEXT_FOLDER_ID")
+GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
 
 CLOUDINARY_CLOUD_NAME = "dnbjvccgy"
 CLOUDINARY_UPLOAD_PRESET = "vamit5_reels"
 
 STATE_FILE = "state.json"
+DELTA_FILE = "state_delta.json"
 MIN_CLIP_SECONDS = 9
 MIN_TOTAL_SECONDS = 15
 COOLDOWN_DAYS = 20
@@ -113,6 +114,27 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2)
+
+
+def apply_delta():
+    if not os.path.exists(DELTA_FILE):
+        return
+    with open(DELTA_FILE, "r", encoding="utf-8") as fh:
+        delta = json.load(fh)
+
+    state = load_state()
+    for file_id, name in delta["history_updates"]:
+        entry = state["history"].get(file_id, {"name": name, "times_posted": 0})
+        entry["name"] = name
+        entry["last_posted"] = delta["now"]
+        entry["times_posted"] = entry.get("times_posted", 0) + 1
+        state["history"][file_id] = entry
+
+    if delta.get("text_used"):
+        state["text_index"] = (state["text_index"] + 1) % len(OVERLAY_TEXTS)
+
+    save_state(state)
+    os.remove(DELTA_FILE)
 
 
 def rank_files(files, history, now):
@@ -405,7 +427,6 @@ def main():
             final_path = os.path.join(tmp, "final.mp4")
             apply_text_overlay(base_path, overlay_png, final_path)
             upload_path = final_path
-            state["text_index"] = (state["text_index"] + 1) % len(OVERLAY_TEXTS)
         else:
             upload_path = base_path
 
@@ -414,14 +435,18 @@ def main():
         print("Objavljeno:", result)
 
     now_iso = now.isoformat()
-    for f in chosen_files:
-        entry = history.get(f["id"], {"name": f["name"], "times_posted": 0})
-        entry["name"] = f["name"]
-        entry["last_posted"] = now_iso
-        entry["times_posted"] = entry.get("times_posted", 0) + 1
-        history[f["id"]] = entry
-    save_state(state)
+    delta = {
+        "now": now_iso,
+        "history_updates": [[f["id"], f["name"]] for f in chosen_files],
+        "text_used": folder == "text",
+    }
+    with open(DELTA_FILE, "w", encoding="utf-8") as fh:
+        json.dump(delta, fh)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--apply-delta" in sys.argv:
+        apply_delta()
+    else:
+        main()
