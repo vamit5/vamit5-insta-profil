@@ -6,6 +6,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: post-reel
+  cancel-in-progress: false
+
 jobs:
   post:
     runs-on: ubuntu-latest
