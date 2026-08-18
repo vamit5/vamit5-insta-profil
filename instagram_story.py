@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 
 import requests
+from PIL import Image
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2 import service_account
@@ -20,7 +21,6 @@ CLOUDINARY_UPLOAD_PRESET = "vamit5_reels"
 
 STATE_FILE = "state.json"
 DELTA_FILE = "state_delta_story.json"
-VIDEO_MIME_PREFIX = "video/"
 MAX_DIMENSION = 1080
 
 
@@ -56,7 +56,7 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def list_story_videos(drive):
+def list_story_media(drive):
     files = []
     page_token = None
     while True:
@@ -67,7 +67,12 @@ def list_story_videos(drive):
             pageSize=1000,
         ).execute())
         for f in response.get("files", []):
-            if f.get("mimeType", "").startswith(VIDEO_MIME_PREFIX):
+            mime = f.get("mimeType", "")
+            if mime.startswith("video/"):
+                f["kind"] = "video"
+                files.append(f)
+            elif mime.startswith("image/"):
+                f["kind"] = "image"
                 files.append(f)
         page_token = response.get("nextPageToken")
         if not page_token:
@@ -114,7 +119,7 @@ def download_file(drive, file_id, dest_path):
     run_with_retries(attempt)
 
 
-def compress_for_story(input_path, output_path):
+def compress_video_for_story(input_path, output_path):
     scale_expr_w = f"if(gt(iw,ih),min({MAX_DIMENSION},iw),-2)"
     scale_expr_h = f"if(gt(iw,ih),-2,min({MAX_DIMENSION},ih))"
     cmd = [
@@ -127,8 +132,20 @@ def compress_for_story(input_path, output_path):
     subprocess.run(cmd, check=True)
 
 
-def upload_to_cloudinary(path):
-    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/video/upload"
+def resize_image_for_story(input_path, output_path):
+    img = Image.open(input_path)
+    img = img.convert("RGB")
+    width, height = img.size
+    longer = max(width, height)
+    if longer > MAX_DIMENSION:
+        scale = MAX_DIMENSION / longer
+        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    img.save(output_path, "JPEG", quality=90)
+
+
+def upload_to_cloudinary(path, resource_type):
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD_NAME}/{resource_type}/upload"
 
     def attempt():
         with open(path, "rb") as fh:
@@ -144,15 +161,19 @@ def upload_to_cloudinary(path):
     return run_with_retries(attempt)
 
 
-def publish_story(video_url):
+def publish_story(media_url, kind):
     create_url = f"https://graph.instagram.com/v21.0/{IG_ACCOUNT_ID}/media"
 
     def create_container():
-        resp = requests.post(create_url, data={
+        data = {
             "media_type": "STORIES",
-            "video_url": video_url,
             "access_token": IG_ACCESS_TOKEN,
-        }, timeout=60)
+        }
+        if kind == "video":
+            data["video_url"] = media_url
+        else:
+            data["image_url"] = media_url
+        resp = requests.post(create_url, data=data, timeout=60)
         check_response(resp)
         return resp.json()["id"]
 
@@ -176,7 +197,7 @@ def publish_story(video_url):
         if status_code == "ERROR":
             raise RuntimeError("Instagram story container processing failed")
     else:
-        raise RuntimeError("Timed out waiting for Instagram to process the story video")
+        raise RuntimeError("Timed out waiting for Instagram to process the story media")
 
     publish_url = f"https://graph.instagram.com/v21.0/{IG_ACCOUNT_ID}/media_publish"
 
@@ -193,9 +214,9 @@ def publish_story(video_url):
 
 def main():
     drive = get_drive_service()
-    files = list_story_videos(drive)
+    files = list_story_media(drive)
     if not files:
-        raise RuntimeError("Nema video fajlova u Story Google Drive folderu")
+        raise RuntimeError("Nema fotografija ni video fajlova u Story Google Drive folderu")
 
     state = load_state()
     last_index = state.get("story_last_index", -1)
@@ -206,11 +227,17 @@ def main():
         local_path = os.path.join(tmp, chosen["id"])
         download_file(drive, chosen["id"], local_path)
 
-        upload_path = os.path.join(tmp, "story.mp4")
-        compress_for_story(local_path, upload_path)
+        if chosen["kind"] == "video":
+            upload_path = os.path.join(tmp, "story.mp4")
+            compress_video_for_story(local_path, upload_path)
+            resource_type = "video"
+        else:
+            upload_path = os.path.join(tmp, "story.jpg")
+            resize_image_for_story(local_path, upload_path)
+            resource_type = "image"
 
-        video_url = upload_to_cloudinary(upload_path)
-        result = publish_story(video_url)
+        media_url = upload_to_cloudinary(upload_path, resource_type)
+        result = publish_story(media_url, chosen["kind"])
         print("Story objavljena:", result)
 
     delta = {"index": next_index}
