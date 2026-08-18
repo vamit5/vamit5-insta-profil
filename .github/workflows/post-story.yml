@@ -1,0 +1,64 @@
+name: Post Story
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: post-reel
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run story posting script
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_ACCOUNT_ID: ${{ secrets.IG_ACCOUNT_ID }}
+          GDRIVE_STORY_FOLDER_ID: ${{ secrets.GDRIVE_STORY_FOLDER_ID }}
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: python instagram_story.py
+
+      - name: Commit updated story rotation state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ ! -f state_delta_story.json ]; then
+            echo "Nema izmene za cuvanje."
+            exit 0
+          fi
+          for i in 1 2 3 4 5 6 7 8; do
+            git fetch origin main
+            git checkout origin/main -- state.json 2>/dev/null || true
+            python instagram_story.py --apply-delta
+            git add state.json
+            if git diff --cached --quiet; then
+              exit 0
+            fi
+            git commit -m "Update story rotation state"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push odbijen, pokusavam ponovo (pokusaj $i)..."
+            git reset --hard origin/main
+            sleep $((3 + i))
+          done
+          echo "Nije uspelo cuvanje story istorije posle vise pokusaja" >&2
+          exit 1
