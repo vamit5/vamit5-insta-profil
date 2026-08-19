@@ -21,7 +21,8 @@ CLOUDINARY_UPLOAD_PRESET = "vamit5_reels"
 
 STATE_FILE = "state.json"
 DELTA_FILE = "state_delta_story.json"
-MAX_DIMENSION = 1080
+FRAME_W = 1080
+FRAME_H = 1920
 
 
 def check_response(resp):
@@ -120,11 +121,11 @@ def download_file(drive, file_id, dest_path):
 
 
 def compress_video_for_story(input_path, output_path):
-    scale_expr_w = f"if(gt(iw,ih),min({MAX_DIMENSION},iw),-2)"
-    scale_expr_h = f"if(gt(iw,ih),-2,min({MAX_DIMENSION},ih))"
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
-        "-vf", f"scale='{scale_expr_w}':'{scale_expr_h}'",
+        "-vf",
+        f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=decrease,"
+        f"pad={FRAME_W}:{FRAME_H}:(ow-iw)/2:(oh-ih)/2,setsar=1",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-c:a", "aac", "-b:a", "128k",
         output_path,
@@ -135,13 +136,11 @@ def compress_video_for_story(input_path, output_path):
 def resize_image_for_story(input_path, output_path):
     img = Image.open(input_path)
     img = img.convert("RGB")
-    width, height = img.size
-    longer = max(width, height)
-    if longer > MAX_DIMENSION:
-        scale = MAX_DIMENSION / longer
-        new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    img.save(output_path, "JPEG", quality=90)
+    img.thumbnail((FRAME_W, FRAME_H), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (FRAME_W, FRAME_H), (0, 0, 0))
+    offset = ((FRAME_W - img.width) // 2, (FRAME_H - img.height) // 2)
+    canvas.paste(img, offset)
+    canvas.save(output_path, "JPEG", quality=90)
 
 
 def upload_to_cloudinary(path, resource_type):
