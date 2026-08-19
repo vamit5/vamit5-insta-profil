@@ -24,7 +24,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install ffmpeg and fonts
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+        run: |
+          for i in 1 2 3; do
+            timeout 120 sudo apt-get update && timeout 180 sudo apt-get install -y ffmpeg fonts-dejavu-core && break
+            echo "apt-get pokusaj $i nije uspeo, probam ponovo..."
+            sleep 10
+          done
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
