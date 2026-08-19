@@ -26,7 +26,7 @@ jobs:
       - name: Install ffmpeg
         run: |
           for i in 1 2 3; do
-            timeout 120 sudo apt-get update && timeout 180 sudo apt-get install -y ffmpeg && break
+            timeout 60 sudo apt-get update && timeout 240 sudo apt-get install -y --no-install-recommends ffmpeg && break
             echo "apt-get pokusaj $i nije uspeo, probam ponovo..."
             sleep 10
           done
